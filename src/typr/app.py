@@ -89,9 +89,15 @@ class TyprApp(QObject):
         # UI
         self.tray_icon.settings_requested.connect(self._show_settings)
         self.tray_icon.quit_requested.connect(self._quit)
+        self.tray_icon.record_toggled.connect(self._on_record_toggled)
 
-        # State changes
-        self.state_changed.connect(self._on_state_changed)
+    @pyqtSlot(bool)
+    def _on_record_toggled(self, start: bool) -> None:
+        """Handle manual record toggle from tray icon."""
+        if start:
+            self._on_recording_start()
+        else:
+            self._on_recording_stop()
 
     def start(self) -> None:
         """Start the application."""
@@ -126,7 +132,7 @@ class TyprApp(QObject):
         self.tray_icon.show()
         self.tray_icon.show_notification(
             "Typr Started",
-            f"Press {self.config.hotkeys.push_to_talk} to record",
+            f"Hold {self.config.hotkeys.push_to_talk} to record",
             self.tray_icon.MessageIcon.Information,
             2000,
         )
@@ -288,6 +294,7 @@ class TyprApp(QObject):
         # Cleanup
         self.audio_recorder.cleanup()
         self.hotkey_manager.cleanup()
+        self.text_injector.cleanup()
 
         # Quit application
         QApplication.quit()

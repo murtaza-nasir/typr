@@ -33,8 +33,8 @@ class SettingsDialog(QDialog):
 
     settings_saved = pyqtSignal()
 
-    # Available Whisper models
-    MODELS = [
+    # Default Whisper models (for OpenAI)
+    DEFAULT_MODELS = [
         ("whisper-1", "Whisper 1 (Standard)"),
         ("gpt-4o-transcribe", "GPT-4o Transcribe (Better accuracy)"),
         ("gpt-4o-mini-transcribe", "GPT-4o Mini Transcribe (Faster)"),
@@ -101,11 +101,19 @@ class SettingsDialog(QDialog):
         trans_group = QGroupBox("Transcription")
         trans_layout = QFormLayout(trans_group)
 
-        # Model selection
+        # Model selection with fetch button
+        model_layout = QHBoxLayout()
         self._model_combo = QComboBox()
-        for model_id, model_name in self.MODELS:
+        self._model_combo.setEditable(True)  # Allow custom model names
+        for model_id, model_name in self.DEFAULT_MODELS:
             self._model_combo.addItem(model_name, model_id)
-        trans_layout.addRow("Model:", self._model_combo)
+        model_layout.addWidget(self._model_combo, 1)
+
+        self._fetch_models_btn = QPushButton("Fetch")
+        self._fetch_models_btn.setToolTip("Fetch available models from API endpoint")
+        self._fetch_models_btn.clicked.connect(self._fetch_models)
+        model_layout.addWidget(self._fetch_models_btn)
+        trans_layout.addRow("Model:", model_layout)
 
         # Language selection
         self._language_combo = QComboBox()
@@ -309,10 +317,13 @@ class SettingsDialog(QDialog):
         self._api_key_edit.setText(self.config.api_key)
         self._api_base_edit.setText(self.config.api_base_url)
 
-        # Transcription
+        # Transcription - handle both preset and custom models
         model_index = self._model_combo.findData(self.config.transcription.model)
         if model_index >= 0:
             self._model_combo.setCurrentIndex(model_index)
+        else:
+            # Custom model - set as editable text
+            self._model_combo.setCurrentText(self.config.transcription.model)
 
         lang_index = self._language_combo.findData(self.config.transcription.language)
         if lang_index >= 0:
@@ -344,8 +355,9 @@ class SettingsDialog(QDialog):
         self.config.api_key = self._api_key_edit.text()
         self.config.api_base_url = self._api_base_edit.text() or "https://api.openai.com/v1"
 
-        # Transcription
-        self.config.transcription.model = self._model_combo.currentData()
+        # Transcription - handle both preset (data) and custom (text) models
+        model_data = self._model_combo.currentData()
+        self.config.transcription.model = model_data if model_data else self._model_combo.currentText()
         self.config.transcription.language = self._language_combo.currentData()
         self.config.transcription.prompt = self._prompt_edit.toPlainText()
 
@@ -389,6 +401,69 @@ class SettingsDialog(QDialog):
         else:
             self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
             self._show_key_btn.setText("Show")
+
+    def _fetch_models(self) -> None:
+        """Fetch available models from the API endpoint."""
+        base_url = self._api_base_edit.text() or "https://api.openai.com/v1"
+        api_key = self._api_key_edit.text()
+
+        self._fetch_models_btn.setEnabled(False)
+        self._fetch_models_btn.setText("...")
+
+        try:
+            import httpx
+
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(f"{base_url.rstrip('/')}/models", headers=headers)
+                response.raise_for_status()
+                data = response.json()
+
+            # Extract model IDs
+            models = []
+            if "data" in data:
+                for model in data["data"]:
+                    model_id = model.get("id", "")
+                    if model_id:
+                        models.append(model_id)
+            elif isinstance(data, list):
+                for model in data:
+                    if isinstance(model, str):
+                        models.append(model)
+                    elif isinstance(model, dict):
+                        models.append(model.get("id", model.get("name", "")))
+
+            if not models:
+                QMessageBox.warning(self, "No Models", "No models found at this endpoint")
+                return
+
+            # Update combo box
+            current_model = self._model_combo.currentText()
+            self._model_combo.clear()
+            for model_id in sorted(models):
+                self._model_combo.addItem(model_id, model_id)
+
+            # Restore selection if possible
+            index = self._model_combo.findText(current_model)
+            if index >= 0:
+                self._model_combo.setCurrentIndex(index)
+
+            QMessageBox.information(
+                self, "Models Loaded", f"Found {len(models)} model(s)"
+            )
+
+        except httpx.HTTPStatusError as e:
+            QMessageBox.warning(
+                self, "Error", f"API error: {e.response.status_code}\n{e.response.text[:200]}"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to fetch models: {e}")
+        finally:
+            self._fetch_models_btn.setEnabled(True)
+            self._fetch_models_btn.setText("Fetch")
 
     def _test_connection(self) -> None:
         """Test API connection."""

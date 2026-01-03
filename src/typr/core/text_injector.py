@@ -1,14 +1,123 @@
-"""Text injection using wtype for Wayland."""
+"""Text injection using evdev UInput for Wayland/X11."""
 
-import shutil
-import subprocess
+import time
 from typing import Optional
 
 from typr.utils.logger import logger
 
+try:
+    from evdev import UInput, ecodes
+
+    EVDEV_AVAILABLE = True
+except ImportError:
+    EVDEV_AVAILABLE = False
+    logger.warning("evdev not available for text injection")
+
+
+# Character to key code mapping (US keyboard layout)
+CHAR_TO_KEY = {
+    "a": (ecodes.KEY_A, False),
+    "b": (ecodes.KEY_B, False),
+    "c": (ecodes.KEY_C, False),
+    "d": (ecodes.KEY_D, False),
+    "e": (ecodes.KEY_E, False),
+    "f": (ecodes.KEY_F, False),
+    "g": (ecodes.KEY_G, False),
+    "h": (ecodes.KEY_H, False),
+    "i": (ecodes.KEY_I, False),
+    "j": (ecodes.KEY_J, False),
+    "k": (ecodes.KEY_K, False),
+    "l": (ecodes.KEY_L, False),
+    "m": (ecodes.KEY_M, False),
+    "n": (ecodes.KEY_N, False),
+    "o": (ecodes.KEY_O, False),
+    "p": (ecodes.KEY_P, False),
+    "q": (ecodes.KEY_Q, False),
+    "r": (ecodes.KEY_R, False),
+    "s": (ecodes.KEY_S, False),
+    "t": (ecodes.KEY_T, False),
+    "u": (ecodes.KEY_U, False),
+    "v": (ecodes.KEY_V, False),
+    "w": (ecodes.KEY_W, False),
+    "x": (ecodes.KEY_X, False),
+    "y": (ecodes.KEY_Y, False),
+    "z": (ecodes.KEY_Z, False),
+    "A": (ecodes.KEY_A, True),
+    "B": (ecodes.KEY_B, True),
+    "C": (ecodes.KEY_C, True),
+    "D": (ecodes.KEY_D, True),
+    "E": (ecodes.KEY_E, True),
+    "F": (ecodes.KEY_F, True),
+    "G": (ecodes.KEY_G, True),
+    "H": (ecodes.KEY_H, True),
+    "I": (ecodes.KEY_I, True),
+    "J": (ecodes.KEY_J, True),
+    "K": (ecodes.KEY_K, True),
+    "L": (ecodes.KEY_L, True),
+    "M": (ecodes.KEY_M, True),
+    "N": (ecodes.KEY_N, True),
+    "O": (ecodes.KEY_O, True),
+    "P": (ecodes.KEY_P, True),
+    "Q": (ecodes.KEY_Q, True),
+    "R": (ecodes.KEY_R, True),
+    "S": (ecodes.KEY_S, True),
+    "T": (ecodes.KEY_T, True),
+    "U": (ecodes.KEY_U, True),
+    "V": (ecodes.KEY_V, True),
+    "W": (ecodes.KEY_W, True),
+    "X": (ecodes.KEY_X, True),
+    "Y": (ecodes.KEY_Y, True),
+    "Z": (ecodes.KEY_Z, True),
+    "0": (ecodes.KEY_0, False),
+    "1": (ecodes.KEY_1, False),
+    "2": (ecodes.KEY_2, False),
+    "3": (ecodes.KEY_3, False),
+    "4": (ecodes.KEY_4, False),
+    "5": (ecodes.KEY_5, False),
+    "6": (ecodes.KEY_6, False),
+    "7": (ecodes.KEY_7, False),
+    "8": (ecodes.KEY_8, False),
+    "9": (ecodes.KEY_9, False),
+    " ": (ecodes.KEY_SPACE, False),
+    "\n": (ecodes.KEY_ENTER, False),
+    "\t": (ecodes.KEY_TAB, False),
+    ".": (ecodes.KEY_DOT, False),
+    ",": (ecodes.KEY_COMMA, False),
+    "!": (ecodes.KEY_1, True),
+    "@": (ecodes.KEY_2, True),
+    "#": (ecodes.KEY_3, True),
+    "$": (ecodes.KEY_4, True),
+    "%": (ecodes.KEY_5, True),
+    "^": (ecodes.KEY_6, True),
+    "&": (ecodes.KEY_7, True),
+    "*": (ecodes.KEY_8, True),
+    "(": (ecodes.KEY_9, True),
+    ")": (ecodes.KEY_0, True),
+    "-": (ecodes.KEY_MINUS, False),
+    "_": (ecodes.KEY_MINUS, True),
+    "=": (ecodes.KEY_EQUAL, False),
+    "+": (ecodes.KEY_EQUAL, True),
+    "[": (ecodes.KEY_LEFTBRACE, False),
+    "]": (ecodes.KEY_RIGHTBRACE, False),
+    "{": (ecodes.KEY_LEFTBRACE, True),
+    "}": (ecodes.KEY_RIGHTBRACE, True),
+    "\\": (ecodes.KEY_BACKSLASH, False),
+    "|": (ecodes.KEY_BACKSLASH, True),
+    ";": (ecodes.KEY_SEMICOLON, False),
+    ":": (ecodes.KEY_SEMICOLON, True),
+    "'": (ecodes.KEY_APOSTROPHE, False),
+    '"': (ecodes.KEY_APOSTROPHE, True),
+    "`": (ecodes.KEY_GRAVE, False),
+    "~": (ecodes.KEY_GRAVE, True),
+    "/": (ecodes.KEY_SLASH, False),
+    "?": (ecodes.KEY_SLASH, True),
+    "<": (ecodes.KEY_COMMA, True),
+    ">": (ecodes.KEY_DOT, True),
+} if EVDEV_AVAILABLE else {}
+
 
 class TextInjector:
-    """Injects text into focused window using wtype (Wayland)."""
+    """Injects text using evdev UInput (works on Wayland and X11)."""
 
     def __init__(self, typing_delay: int = 0):
         """Initialize text injector.
@@ -17,19 +126,29 @@ class TextInjector:
             typing_delay: Delay between keystrokes in milliseconds.
         """
         self.typing_delay = typing_delay
-        self._wtype_path: Optional[str] = None
-        self._check_wtype()
+        self._ui: Optional["UInput"] = None
+        self._available = False
+        self._init_uinput()
 
-    def _check_wtype(self) -> None:
-        """Check if wtype is installed."""
-        self._wtype_path = shutil.which("wtype")
-        if not self._wtype_path:
-            logger.warning("wtype not found - text injection will not work")
-            logger.warning("Install with: sudo pacman -S wtype")
+    def _init_uinput(self) -> None:
+        """Initialize UInput device."""
+        if not EVDEV_AVAILABLE:
+            logger.error("evdev not available")
+            return
+
+        try:
+            # Create a virtual keyboard device
+            self._ui = UInput(name="typr-keyboard")
+            self._available = True
+            logger.info("UInput text injector initialized")
+        except PermissionError:
+            logger.error("No permission for /dev/uinput. Add user to 'input' group.")
+        except Exception as e:
+            logger.error(f"Failed to create UInput: {e}")
 
     def is_available(self) -> bool:
         """Check if text injection is available."""
-        return self._wtype_path is not None
+        return self._available and self._ui is not None
 
     def type_text(self, text: str) -> bool:
         """Type text at current cursor position.
@@ -43,49 +162,52 @@ class TextInjector:
         if not text:
             return True
 
-        if not self._wtype_path:
-            logger.error("wtype not available")
+        if not self.is_available():
+            logger.error("Text injector not available")
             return False
 
         try:
-            # Split text by newlines and handle each part
-            parts = text.split("\n")
-            for i, part in enumerate(parts):
-                if part:
-                    # Type the text part
-                    cmd = [self._wtype_path]
-                    if self.typing_delay > 0:
-                        cmd.extend(["-d", str(self.typing_delay)])
-                    cmd.append(part)
+            delay_sec = self.typing_delay / 1000.0 if self.typing_delay > 0 else 0.001
 
-                    result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=30
-                    )
-                    if result.returncode != 0:
-                        logger.error(f"wtype failed: {result.stderr}")
-                        return False
+            for char in text:
+                if char in CHAR_TO_KEY:
+                    key_code, shift = CHAR_TO_KEY[char]
+                    self._type_key(key_code, shift)
+                else:
+                    # Skip unsupported characters
+                    logger.debug(f"Skipping unsupported character: {repr(char)}")
 
-                # Add newline between parts (except after last)
-                if i < len(parts) - 1:
-                    result = subprocess.run(
-                        [self._wtype_path, "-k", "Return"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    if result.returncode != 0:
-                        logger.error(f"wtype newline failed: {result.stderr}")
-                        return False
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
 
             logger.info(f"Typed {len(text)} characters")
             return True
 
-        except subprocess.TimeoutExpired:
-            logger.error("wtype timed out")
-            return False
         except Exception as e:
             logger.error(f"Text injection failed: {e}")
             return False
+
+    def _type_key(self, key_code: int, shift: bool = False) -> None:
+        """Type a single key with optional shift modifier."""
+        if not self._ui:
+            return
+
+        if shift:
+            # Press shift
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTSHIFT, 1)
+            self._ui.syn()
+
+        # Press and release key
+        self._ui.write(ecodes.EV_KEY, key_code, 1)
+        self._ui.syn()
+        time.sleep(0.001)
+        self._ui.write(ecodes.EV_KEY, key_code, 0)
+        self._ui.syn()
+
+        if shift:
+            # Release shift
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTSHIFT, 0)
+            self._ui.syn()
 
     def type_key(self, key: str) -> bool:
         """Press a special key.
@@ -96,50 +218,32 @@ class TextInjector:
         Returns:
             True if successful, False otherwise.
         """
-        if not self._wtype_path:
-            logger.error("wtype not available")
+        if not self.is_available():
+            return False
+
+        key_map = {
+            "return": ecodes.KEY_ENTER,
+            "enter": ecodes.KEY_ENTER,
+            "tab": ecodes.KEY_TAB,
+            "backspace": ecodes.KEY_BACKSPACE,
+            "escape": ecodes.KEY_ESC,
+            "space": ecodes.KEY_SPACE,
+            "up": ecodes.KEY_UP,
+            "down": ecodes.KEY_DOWN,
+            "left": ecodes.KEY_LEFT,
+            "right": ecodes.KEY_RIGHT,
+        }
+
+        key_code = key_map.get(key.lower())
+        if key_code is None:
+            logger.warning(f"Unknown key: {key}")
             return False
 
         try:
-            result = subprocess.run(
-                [self._wtype_path, "-k", key],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return result.returncode == 0
+            self._type_key(key_code)
+            return True
         except Exception as e:
             logger.error(f"Key press failed: {e}")
-            return False
-
-    def type_with_modifier(self, key: str, modifiers: list[str]) -> bool:
-        """Type a key with modifiers.
-
-        Args:
-            key: The key to type.
-            modifiers: List of modifiers (e.g., ['ctrl', 'shift']).
-
-        Returns:
-            True if successful, False otherwise.
-        """
-        if not self._wtype_path:
-            logger.error("wtype not available")
-            return False
-
-        try:
-            cmd = [self._wtype_path]
-            for mod in modifiers:
-                cmd.extend(["-M", mod])
-            cmd.append(key)
-            for mod in modifiers:
-                cmd.extend(["-m", mod])
-
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=5
-            )
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"Modified key press failed: {e}")
             return False
 
     def set_typing_delay(self, delay: int) -> None:
@@ -149,3 +253,16 @@ class TextInjector:
             delay: Delay between keystrokes in milliseconds.
         """
         self.typing_delay = delay
+
+    def cleanup(self) -> None:
+        """Clean up UInput device."""
+        if self._ui:
+            try:
+                self._ui.close()
+            except Exception:
+                pass
+            self._ui = None
+            self._available = False
+
+    def __del__(self):
+        self.cleanup()

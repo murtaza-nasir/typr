@@ -1,266 +1,259 @@
-"""Global hotkey management using KDE's KGlobalAccel D-Bus interface."""
+"""Global hotkey management using evdev for direct keyboard access."""
 
+import threading
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from typr.config import HotkeyConfig
 from typr.utils.logger import logger
 
-# D-Bus imports with graceful fallback
 try:
-    import dbus
-    from dbus.mainloop.glib import DBusGMainLoop
+    import evdev
+    from evdev import InputDevice, categorize, ecodes
 
-    DBUS_AVAILABLE = True
+    EVDEV_AVAILABLE = True
 except ImportError:
-    DBUS_AVAILABLE = False
-    logger.warning("dbus-python not available - hotkeys will not work")
+    EVDEV_AVAILABLE = False
+    logger.warning("evdev not available - install with: pip install evdev")
+
+
+# Key code mappings
+KEY_NAMES = {
+    "space": ecodes.KEY_SPACE if EVDEV_AVAILABLE else 57,
+    "enter": ecodes.KEY_ENTER if EVDEV_AVAILABLE else 28,
+    "return": ecodes.KEY_ENTER if EVDEV_AVAILABLE else 28,
+    "escape": ecodes.KEY_ESC if EVDEV_AVAILABLE else 1,
+    "tab": ecodes.KEY_TAB if EVDEV_AVAILABLE else 15,
+    "backspace": ecodes.KEY_BACKSPACE if EVDEV_AVAILABLE else 14,
+    "f1": ecodes.KEY_F1 if EVDEV_AVAILABLE else 59,
+    "f2": ecodes.KEY_F2 if EVDEV_AVAILABLE else 60,
+    "f3": ecodes.KEY_F3 if EVDEV_AVAILABLE else 61,
+    "f4": ecodes.KEY_F4 if EVDEV_AVAILABLE else 62,
+    "f5": ecodes.KEY_F5 if EVDEV_AVAILABLE else 63,
+    "f6": ecodes.KEY_F6 if EVDEV_AVAILABLE else 64,
+    "f7": ecodes.KEY_F7 if EVDEV_AVAILABLE else 65,
+    "f8": ecodes.KEY_F8 if EVDEV_AVAILABLE else 66,
+    "f9": ecodes.KEY_F9 if EVDEV_AVAILABLE else 67,
+    "f10": ecodes.KEY_F10 if EVDEV_AVAILABLE else 68,
+    "f11": ecodes.KEY_F11 if EVDEV_AVAILABLE else 87,
+    "f12": ecodes.KEY_F12 if EVDEV_AVAILABLE else 88,
+}
+
+# Modifier key codes
+if EVDEV_AVAILABLE:
+    MODIFIER_KEYS = {
+        ecodes.KEY_LEFTMETA: "meta",
+        ecodes.KEY_RIGHTMETA: "meta",
+        ecodes.KEY_LEFTSHIFT: "shift",
+        ecodes.KEY_RIGHTSHIFT: "shift",
+        ecodes.KEY_LEFTCTRL: "ctrl",
+        ecodes.KEY_RIGHTCTRL: "ctrl",
+        ecodes.KEY_LEFTALT: "alt",
+        ecodes.KEY_RIGHTALT: "alt",
+    }
+else:
+    MODIFIER_KEYS = {}
 
 
 class HotkeyManager(QObject):
-    """Manages global hotkey registration with KDE's KGlobalAccel."""
+    """Manages global hotkeys using evdev for direct keyboard access."""
 
     # Signals
     recording_started = pyqtSignal()
     recording_stopped = pyqtSignal()
     hotkey_error = pyqtSignal(str)
 
-    # Component identifiers for KGlobalAccel
-    COMPONENT_NAME = "typr"
-    COMPONENT_FRIENDLY = "Typr"
-
     def __init__(self, config: Optional[HotkeyConfig] = None, parent: Optional[QObject] = None):
         super().__init__(parent)
         self.config = config or HotkeyConfig()
-        self._session_bus: Optional["dbus.SessionBus"] = None
-        self._component: Optional["dbus.Interface"] = None
+        self._devices: list = []
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
         self._registered = False
+
+        # Current modifier state
+        self._modifiers: set[str] = set()
+
+        # Parse the configured hotkey
+        self._target_modifiers: set[str] = set()
+        self._target_key: int = 0
         self._key_pressed = False
 
+        self._parse_hotkey(self.config.push_to_talk)
+
+    def _parse_hotkey(self, hotkey_str: str) -> None:
+        """Parse hotkey string like 'Meta+Shift+Space' into components."""
+        parts = hotkey_str.lower().replace(" ", "").split("+")
+
+        self._target_modifiers = set()
+        self._target_key = 0
+
+        for part in parts:
+            if part in ("meta", "super", "win"):
+                self._target_modifiers.add("meta")
+            elif part in ("shift",):
+                self._target_modifiers.add("shift")
+            elif part in ("ctrl", "control"):
+                self._target_modifiers.add("ctrl")
+            elif part in ("alt",):
+                self._target_modifiers.add("alt")
+            elif part in KEY_NAMES:
+                self._target_key = KEY_NAMES[part]
+            elif len(part) == 1 and part.isalpha():
+                # Single letter key
+                if EVDEV_AVAILABLE:
+                    key_name = f"KEY_{part.upper()}"
+                    self._target_key = getattr(ecodes, key_name, 0)
+            else:
+                logger.warning(f"Unknown key in hotkey: {part}")
+
+        logger.info(f"Parsed hotkey: modifiers={self._target_modifiers}, key={self._target_key}")
+
     def initialize(self) -> bool:
-        """Initialize D-Bus connection and register shortcuts.
+        """Initialize evdev keyboard listeners.
 
         Returns:
-            True if initialization was successful, False otherwise.
+            True if initialization was successful.
         """
-        if not DBUS_AVAILABLE:
-            self.hotkey_error.emit("D-Bus not available")
+        if not EVDEV_AVAILABLE:
+            self.hotkey_error.emit("evdev not installed. Run: pip install evdev")
             return False
 
         try:
-            # Initialize D-Bus main loop
-            DBusGMainLoop(set_as_default=True)
-            self._session_bus = dbus.SessionBus()
+            # Find all keyboard devices
+            self._devices = []
+            input_dir = Path("/dev/input")
 
-            # Register shortcuts
-            self._register_shortcuts()
-            self._connect_signals()
+            for event_file in sorted(input_dir.glob("event*")):
+                try:
+                    device = InputDevice(str(event_file))
+                    capabilities = device.capabilities()
 
-            logger.info("Hotkey manager initialized")
-            return True
+                    # Check if device has keyboard keys (EV_KEY with typical keyboard codes)
+                    if ecodes.EV_KEY in capabilities:
+                        keys = capabilities[ecodes.EV_KEY]
+                        # Check for common keyboard keys
+                        if ecodes.KEY_SPACE in keys or ecodes.KEY_A in keys:
+                            self._devices.append(device)
+                            logger.debug(f"Found keyboard: {device.name} ({device.path})")
+                except PermissionError:
+                    logger.debug(f"No permission for {event_file}")
+                except Exception as e:
+                    logger.debug(f"Error opening {event_file}: {e}")
 
-        except dbus.exceptions.DBusException as e:
-            error_msg = f"D-Bus error: {e}"
-            logger.error(error_msg)
-            self.hotkey_error.emit(error_msg)
-            return False
-        except Exception as e:
-            error_msg = f"Hotkey initialization failed: {e}"
-            logger.error(error_msg)
-            self.hotkey_error.emit(error_msg)
-            return False
-
-    def _register_shortcuts(self) -> None:
-        """Register shortcuts with KGlobalAccel."""
-        if not self._session_bus:
-            return
-
-        # Get KGlobalAccel interface
-        kglobalaccel = self._session_bus.get_object(
-            "org.kde.kglobalaccel", "/kglobalaccel"
-        )
-        kga_iface = dbus.Interface(kglobalaccel, "org.kde.KGlobalAccel")
-
-        # Action ID format: [component, action, friendly_component, friendly_action]
-        action_id = dbus.Array(
-            [
-                self.COMPONENT_NAME,
-                "push_to_talk",
-                self.COMPONENT_FRIENDLY,
-                "Push to Talk",
-            ],
-            signature="s",
-        )
-
-        # Register the action
-        try:
-            # doRegister returns the component path
-            kga_iface.doRegister(action_id)
-            logger.debug("Registered push_to_talk action")
-
-            # Parse and set the shortcut
-            shortcut_keys = self._parse_shortcut(self.config.push_to_talk)
-            if shortcut_keys:
-                # setShortcutKeys expects action_id and array of key sequences
-                kga_iface.setShortcutKeys(
-                    action_id,
-                    dbus.Array([dbus.Array(shortcut_keys, signature="i")], signature="ai"),
-                    0x2,  # SetPresent flag
-                )
-                logger.info(f"Set shortcut: {self.config.push_to_talk}")
-
-            self._registered = True
-
-        except dbus.exceptions.DBusException as e:
-            logger.error(f"Failed to register shortcut: {e}")
-            raise
-
-    def _connect_signals(self) -> None:
-        """Connect to component signals for press/release."""
-        if not self._session_bus:
-            return
-
-        try:
-            # Get the component object
-            component_path = f"/component/{self.COMPONENT_NAME}"
-            component = self._session_bus.get_object(
-                "org.kde.kglobalaccel", component_path
-            )
-
-            # Store interface for later use
-            self._component = dbus.Interface(
-                component, "org.kde.kglobalaccel.Component"
-            )
-
-            # Connect to signals
-            component.connect_to_signal(
-                "globalShortcutPressed",
-                self._on_shortcut_pressed,
-                dbus_interface="org.kde.kglobalaccel.Component",
-            )
-
-            component.connect_to_signal(
-                "globalShortcutReleased",
-                self._on_shortcut_released,
-                dbus_interface="org.kde.kglobalaccel.Component",
-            )
-
-            logger.debug("Connected to shortcut signals")
-
-        except dbus.exceptions.DBusException as e:
-            logger.error(f"Failed to connect signals: {e}")
-            raise
-
-    def _on_shortcut_pressed(
-        self, component: str, shortcut: str, timestamp: int
-    ) -> None:
-        """Handle shortcut press event."""
-        if shortcut == "push_to_talk" and not self._key_pressed:
-            self._key_pressed = True
-            logger.debug("Push-to-talk pressed")
-            self.recording_started.emit()
-
-    def _on_shortcut_released(
-        self, component: str, shortcut: str, timestamp: int
-    ) -> None:
-        """Handle shortcut release event."""
-        if shortcut == "push_to_talk" and self._key_pressed:
-            self._key_pressed = False
-            logger.debug("Push-to-talk released")
-            self.recording_stopped.emit()
-
-    def _parse_shortcut(self, shortcut_str: str) -> list[int]:
-        """Convert shortcut string to Qt key codes.
-
-        Args:
-            shortcut_str: Shortcut like 'Meta+Shift+Space'.
-
-        Returns:
-            List of key codes for KGlobalAccel.
-        """
-        from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QKeySequence
-
-        try:
-            # Parse using Qt
-            seq = QKeySequence.fromString(shortcut_str)
-            if seq.isEmpty():
-                logger.warning(f"Invalid shortcut: {shortcut_str}")
-                return []
-
-            # Get the key combination
-            key_combo = seq[0]
-            key = int(key_combo.key())
-            modifiers = int(key_combo.keyboardModifiers())
-
-            # Combine into single int (Qt format that KGlobalAccel understands)
-            return [key | modifiers]
-
-        except Exception as e:
-            logger.error(f"Error parsing shortcut '{shortcut_str}': {e}")
-            return []
-
-    def update_shortcut(self, shortcut: str) -> bool:
-        """Update the push-to-talk shortcut.
-
-        Args:
-            shortcut: New shortcut string.
-
-        Returns:
-            True if update was successful.
-        """
-        self.config.push_to_talk = shortcut
-
-        if self._registered:
-            try:
-                self._register_shortcuts()
-                return True
-            except Exception as e:
-                logger.error(f"Failed to update shortcut: {e}")
+            if not self._devices:
+                error_msg = "No keyboard devices found. Make sure you're in the 'input' group."
+                self.hotkey_error.emit(error_msg)
                 return False
 
+            logger.info(f"Found {len(self._devices)} keyboard device(s)")
+
+            # Start listener thread
+            self._running = True
+            self._thread = threading.Thread(target=self._event_loop, daemon=True)
+            self._thread.start()
+
+            self._registered = True
+            logger.info(f"Hotkey manager initialized: {self.config.push_to_talk}")
+            return True
+
+        except Exception as e:
+            error_msg = f"Failed to initialize hotkeys: {e}"
+            logger.error(error_msg)
+            self.hotkey_error.emit(error_msg)
+            return False
+
+    def _event_loop(self) -> None:
+        """Main event loop reading from all keyboard devices."""
+        import select
+
+        # Create selector for all devices
+        devices_by_fd = {dev.fd: dev for dev in self._devices}
+
+        while self._running:
+            try:
+                # Wait for events with timeout
+                r, _, _ = select.select(devices_by_fd.keys(), [], [], 0.1)
+
+                for fd in r:
+                    device = devices_by_fd.get(fd)
+                    if not device:
+                        continue
+
+                    try:
+                        for event in device.read():
+                            if event.type == ecodes.EV_KEY:
+                                self._handle_key_event(event)
+                    except BlockingIOError:
+                        pass
+                    except Exception as e:
+                        logger.debug(f"Error reading from {device.path}: {e}")
+
+            except Exception as e:
+                if self._running:
+                    logger.error(f"Event loop error: {e}")
+
+    def _handle_key_event(self, event) -> None:
+        """Handle a key press/release event."""
+        key_code = event.code
+        key_state = event.value  # 0=release, 1=press, 2=repeat
+
+        # Update modifier state
+        if key_code in MODIFIER_KEYS:
+            modifier = MODIFIER_KEYS[key_code]
+            if key_state == 1:  # Press
+                self._modifiers.add(modifier)
+            elif key_state == 0:  # Release
+                self._modifiers.discard(modifier)
+
+                # If we were recording and a modifier was released, stop
+                if self._key_pressed and modifier in self._target_modifiers:
+                    self._key_pressed = False
+                    logger.debug("Hotkey released (modifier)")
+                    self.recording_stopped.emit()
+            return
+
+        # Check for target key
+        if key_code == self._target_key:
+            if key_state == 1:  # Press
+                # Check if all required modifiers are held
+                if self._target_modifiers <= self._modifiers:
+                    if not self._key_pressed:
+                        self._key_pressed = True
+                        logger.debug("Hotkey pressed")
+                        self.recording_started.emit()
+
+            elif key_state == 0:  # Release
+                if self._key_pressed:
+                    self._key_pressed = False
+                    logger.debug("Hotkey released")
+                    self.recording_stopped.emit()
+
+    def update_shortcut(self, shortcut: str) -> bool:
+        """Update the push-to-talk shortcut."""
+        self.config.push_to_talk = shortcut
+        self._parse_hotkey(shortcut)
         return True
 
     def is_registered(self) -> bool:
-        """Check if shortcuts are registered."""
+        """Check if hotkeys are registered."""
         return self._registered
 
     def cleanup(self) -> None:
-        """Clean up D-Bus resources."""
-        # Note: KGlobalAccel keeps shortcuts registered even after app exits
-        # This is intentional for user convenience
-        self._session_bus = None
-        self._component = None
+        """Clean up resources."""
+        self._running = False
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+        for device in self._devices:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+        self._devices = []
         self._registered = False
-
-
-class FallbackHotkeyManager(QObject):
-    """Fallback hotkey manager using keyboard monitoring.
-
-    Used when KDE D-Bus integration is not available.
-    """
-
-    recording_started = pyqtSignal()
-    recording_stopped = pyqtSignal()
-    hotkey_error = pyqtSignal(str)
-
-    def __init__(self, config: Optional[HotkeyConfig] = None, parent: Optional[QObject] = None):
-        super().__init__(parent)
-        self.config = config or HotkeyConfig()
-        self._active = False
-        logger.warning("Using fallback hotkey manager - functionality may be limited")
-
-    def initialize(self) -> bool:
-        """Initialize fallback hotkey monitoring."""
-        # For now, just emit an error - could implement evdev-based monitoring
-        self.hotkey_error.emit(
-            "KDE shortcuts not available. Please configure a system shortcut manually."
-        )
-        return False
-
-    def is_registered(self) -> bool:
-        return False
-
-    def cleanup(self) -> None:
-        pass
+        logger.info("Hotkey manager cleaned up")

@@ -26,6 +26,7 @@ class TrayIcon(QSystemTrayIcon):
     settings_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     toggle_mode = pyqtSignal()
+    record_toggled = pyqtSignal(bool)  # True = start, False = stop
 
     # State colors for icon generation
     STATE_COLORS = {
@@ -36,10 +37,10 @@ class TrayIcon(QSystemTrayIcon):
     }
 
     STATE_TOOLTIPS = {
-        TrayState.IDLE: "Ready - Press {hotkey} to record",
-        TrayState.RECORDING: "Recording...",
+        TrayState.IDLE: "Ready - Hold {hotkey} to record",
+        TrayState.RECORDING: "Recording... Release to stop",
         TrayState.PROCESSING: "Transcribing...",
-        TrayState.ERROR: "Error - Click for details",
+        TrayState.ERROR: "Error - Right-click for options",
     }
 
     def __init__(self, hotkey: str = "Meta+Shift+Space", parent: Optional[QWidget] = None):
@@ -101,10 +102,10 @@ class TrayIcon(QSystemTrayIcon):
         """Create context menu."""
         menu = QMenu()
 
-        # Mode indicator
-        self._mode_action = QAction("Mode: Push-to-Talk", menu)
-        self._mode_action.setEnabled(False)
-        menu.addAction(self._mode_action)
+        # Record button (main action)
+        self._record_action = QAction("Start Recording", menu)
+        self._record_action.triggered.connect(self._on_record_clicked)
+        menu.addAction(self._record_action)
 
         menu.addSeparator()
 
@@ -128,6 +129,22 @@ class TrayIcon(QSystemTrayIcon):
         menu.addAction(quit_action)
 
         self.setContextMenu(menu)
+
+        # Also trigger on left click
+        self.activated.connect(self._on_activated)
+
+    def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """Handle tray icon activation (click)."""
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            # Left click - toggle recording
+            self._on_record_clicked()
+
+    def _on_record_clicked(self) -> None:
+        """Handle record button click."""
+        if self._state == TrayState.IDLE:
+            self.record_toggled.emit(True)  # Start
+        elif self._state == TrayState.RECORDING:
+            self.record_toggled.emit(False)  # Stop
 
     def set_state(self, state: TrayState, message: Optional[str] = None) -> None:
         """Update icon and tooltip based on state.
@@ -156,6 +173,15 @@ class TrayIcon(QSystemTrayIcon):
         # Update menu status
         self._status_action.setText(f"Status: {self._status_message}")
 
+        # Update record action text
+        if state == TrayState.RECORDING:
+            self._record_action.setText("Stop Recording")
+        else:
+            self._record_action.setText("Start Recording")
+
+        # Disable record during processing
+        self._record_action.setEnabled(state in (TrayState.IDLE, TrayState.RECORDING))
+
         # Update tooltip
         self._update_tooltip()
 
@@ -183,8 +209,6 @@ class TrayIcon(QSystemTrayIcon):
             mode: Either 'push_to_talk' or 'live'.
         """
         self._mode = mode
-        mode_display = "Push-to-Talk" if mode == "push_to_talk" else "Live"
-        self._mode_action.setText(f"Mode: {mode_display}")
 
     def show_notification(
         self,
