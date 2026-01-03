@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Typr
+GenericName=Speech to Text
+Comment=Transcribe speech to text using OpenAI Whisper API
+Exec=typr
+Icon=typr
+Categories=Utility;Accessibility;Audio;
+Keywords=speech;voice;transcription;whisper;dictation;
+StartupNotify=true
+StartupWMClass=typr

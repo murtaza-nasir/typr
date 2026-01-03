@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Typr
+Comment=Speech-to-text with OpenAI Whisper
+Exec=typr
+Icon=typr
+Categories=Utility;Accessibility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
