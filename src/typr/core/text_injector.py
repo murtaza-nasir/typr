@@ -14,6 +14,11 @@ except ImportError:
     logger.warning("evdev not available for text injection")
 
 
+# Name of our virtual keyboard. The hotkey manager uses this to avoid
+# grabbing/reading our own injected events back.
+INJECTOR_DEVICE_NAME = "typr-keyboard"
+
+
 # Character to key code mapping (US keyboard layout)
 CHAR_TO_KEY = {
     "a": (ecodes.KEY_A, False),
@@ -138,7 +143,7 @@ class TextInjector:
 
         try:
             # Create a virtual keyboard device
-            self._ui = UInput(name="typr-keyboard")
+            self._ui = UInput(name=INJECTOR_DEVICE_NAME)
             self._available = True
             logger.info("UInput text injector initialized")
         except PermissionError:
@@ -186,6 +191,32 @@ class TextInjector:
         except Exception as e:
             logger.error(f"Text injection failed: {e}")
             return False
+
+    def reset_modifiers(self) -> None:
+        """Release all modifier keys from the virtual keyboard.
+
+        Grabbing the physical keyboard stops new events reaching the
+        compositor but does NOT clear modifiers that were already latched
+        when the grab happened (e.g. the user holding Shift). Emitting a
+        release for each modifier from our own device gives the compositor a
+        clean slate so injected text isn't corrupted. Call this right after
+        grabbing and before typing.
+        """
+        if not self._ui:
+            return
+
+        for mod in (
+            ecodes.KEY_LEFTSHIFT,
+            ecodes.KEY_RIGHTSHIFT,
+            ecodes.KEY_LEFTCTRL,
+            ecodes.KEY_RIGHTCTRL,
+            ecodes.KEY_LEFTALT,
+            ecodes.KEY_RIGHTALT,
+            ecodes.KEY_LEFTMETA,
+            ecodes.KEY_RIGHTMETA,
+        ):
+            self._ui.write(ecodes.EV_KEY, mod, 0)
+        self._ui.syn()
 
     def _type_key(self, key_code: int, shift: bool = False) -> None:
         """Type a single key with optional shift modifier."""

@@ -3,7 +3,7 @@
 from enum import Enum, auto
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication
 
 from typr.config import AppConfig
@@ -14,6 +14,33 @@ from typr.core.text_injector import TextInjector
 from typr.core.transcriber import WhisperTranscriber
 from typr.ui.tray_icon import TrayIcon, TrayState
 from typr.utils.logger import logger
+
+
+class TypingWorker(QThread):
+    """Injects transcribed text off the GUI thread.
+
+    type_text() sleeps between keystrokes, so running it on the Qt main
+    thread freezes the tray UI for the duration of a long transcription.
+    The keyboard grab is owned by the app state machine (armed when recording
+    stops, released when we return to IDLE/ERROR), so this worker only resets
+    any latched modifiers and types.
+    """
+
+    finished = pyqtSignal(bool)  # success
+
+    def __init__(self, injector, text: str, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._injector = injector
+        self._text = text
+
+    def run(self) -> None:
+        success = False
+        try:
+            self._injector.reset_modifiers()
+            success = self._injector.type_text(self._text)
+        except Exception as e:
+            logger.error(f"Text injection failed: {e}")
+        self.finished.emit(success)
 
 
 class AppState(Enum):
@@ -75,6 +102,18 @@ class TyprApp(QObject):
         # Dialogs (lazy loaded)
         self._settings_dialog: Optional["SettingsDialog"] = None
         self._history_dialog: Optional["HistoryDialog"] = None
+
+        # Background text-injection worker
+        self._typing_worker: Optional[TypingWorker] = None
+        self._typing_text: str = ""
+
+        # Safety watchdog: force-release the keyboard grab if it is ever held
+        # too long (e.g. a hung transcription), so the keyboard can never get
+        # stuck grabbed. Generous interval; normal flow ungrabs well before.
+        self._grab_watchdog = QTimer(self)
+        self._grab_watchdog.setSingleShot(True)
+        self._grab_watchdog.setInterval(30000)
+        self._grab_watchdog.timeout.connect(self._on_grab_watchdog)
 
     def _connect_signals(self) -> None:
         """Connect all component signals."""
@@ -186,20 +225,37 @@ class TyprApp(QObject):
         self._record_history(text)
         self._set_state(AppState.TYPING)
 
-        # Type the text
-        if self.text_injector.type_text(text):
+        # Type the text on a background thread so the GUI stays responsive.
+        # The keyboard is already grabbed (armed when recording stopped); the
+        # grab is released when we return to IDLE/ERROR in _set_state.
+        self._typing_text = text
+        self._typing_worker = TypingWorker(self.text_injector, text)
+        self._typing_worker.finished.connect(self._on_typing_finished)
+        self._typing_worker.start()
+
+    @pyqtSlot(bool)
+    def _on_typing_finished(self, success: bool) -> None:
+        """Handle completion of background text injection."""
+        if success:
             if self.config.ui.show_notifications:
+                text = self._typing_text
                 self.tray_icon.show_notification(
                     "Transcription Complete",
                     text[:100] + ("..." if len(text) > 100 else ""),
                     self.tray_icon.MessageIcon.Information,
                     self.config.ui.notification_duration,
                 )
+            self._set_state(AppState.IDLE)
         else:
             self._set_state(AppState.ERROR, "Failed to type text")
-            return
 
-        self._set_state(AppState.IDLE)
+        self._cleanup_typing_worker()
+
+    def _cleanup_typing_worker(self) -> None:
+        """Clean up the background typing worker."""
+        if self._typing_worker:
+            self._typing_worker.deleteLater()
+            self._typing_worker = None
 
     def _record_history(self, text: str) -> None:
         """Persist a completed transcription to history if enabled."""
@@ -242,6 +298,18 @@ class TyprApp(QObject):
 
         logger.debug(f"State: {old_state.name} -> {state.name}")
 
+        # Keyboard grab lifecycle. Arm the grab the moment recording stops so
+        # the whole vulnerable window (transcription wait + injection) is
+        # protected, but arm_grab() defers the actual grab until the hotkey is
+        # fully released so its modifiers can't get stranded. Release on any
+        # return to IDLE/ERROR, and run a watchdog so it can never stick.
+        if state == AppState.TRANSCRIBING and old_state != AppState.TRANSCRIBING:
+            self.hotkey_manager.arm_grab()
+            self._grab_watchdog.start()
+        elif state in (AppState.IDLE, AppState.ERROR):
+            self._grab_watchdog.stop()
+            self.hotkey_manager.ungrab_all()
+
         # Map to tray states
         tray_state = {
             AppState.IDLE: TrayState.IDLE,
@@ -259,6 +327,12 @@ class TyprApp(QObject):
             if message:
                 self.tray_icon.show_error(message)
             QTimer.singleShot(3000, self._recover_from_error)
+
+    @pyqtSlot()
+    def _on_grab_watchdog(self) -> None:
+        """Force-release the keyboard grab if it was held too long."""
+        logger.warning("Grab watchdog fired - force-releasing keyboard")
+        self.hotkey_manager.ungrab_all()
 
     @pyqtSlot()
     def _recover_from_error(self) -> None:
@@ -320,6 +394,10 @@ class TyprApp(QObject):
         # Cancel any ongoing recording
         if self._state == AppState.RECORDING:
             self.audio_recorder.cancel_recording()
+
+        # Let any in-flight injection finish so it ungrabs the keyboard
+        if self._typing_worker and self._typing_worker.isRunning():
+            self._typing_worker.wait(2000)
 
         # Save config
         self.config.save()
