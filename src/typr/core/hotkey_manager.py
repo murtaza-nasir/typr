@@ -77,6 +77,11 @@ class HotkeyManager(QObject):
         self._running = False
         self._registered = False
 
+        # All physically-held key codes, so we can tell when the keyboard is
+        # idle. Used to defer an armed grab until the hotkey is fully released.
+        self._pressed_keys: set[int] = set()
+        self._grab_armed = False
+
         # Safety net: if the process exits while keyboards are grabbed,
         # release them so the user isn't locked out. (A hard crash closes
         # the fds and the kernel auto-releases the grab anyway, but this
@@ -261,6 +266,18 @@ class HotkeyManager(QObject):
         key_code = event.code
         key_state = event.value  # 0=release, 1=press, 2=repeat
 
+        # Track every physically-held key so we know when the keyboard is
+        # idle. A grab armed while the hotkey is still being released is
+        # deferred until here, the moment the last key comes up — by then the
+        # compositor has already seen those release events, so grabbing can't
+        # strand them (which is what previously left modifiers stuck down).
+        if key_state in (1, 2):
+            self._pressed_keys.add(key_code)
+        elif key_state == 0:
+            self._pressed_keys.discard(key_code)
+            if self._grab_armed and not self._pressed_keys:
+                self._do_armed_grab()
+
         # Update modifier state
         if key_code in MODIFIER_KEYS:
             modifier = MODIFIER_KEYS[key_code]
@@ -312,14 +329,35 @@ class HotkeyManager(QObject):
         """Check if hotkeys are registered."""
         return self._registered
 
+    def arm_grab(self) -> None:
+        """Grab the keyboard as soon as it is physically idle.
+
+        Deferring until no keys are held is what makes grabbing safe with a
+        modifier-combo push-to-talk hotkey: grabbing mid-release would swallow
+        the hotkey's own Ctrl/Alt release events and leave them stuck down.
+        If the keyboard is already idle, grabs immediately; otherwise the grab
+        happens in _handle_key_event when the last key is released.
+        """
+        self._grab_armed = True
+        if not self._pressed_keys:
+            self._do_armed_grab()
+
+    def _do_armed_grab(self) -> None:
+        """Perform a previously armed grab and disarm."""
+        self._grab_armed = False
+        if not self._grabbed:
+            self.grab_all()
+
     def grab_all(self) -> None:
         """Take exclusive access to all physical keyboards.
 
         While grabbed, physical key events do not reach the compositor, so
-        text injected immediately afterwards cannot be corrupted by keys the
-        user happens to be pressing. Must be paired with ungrab_all() in a
-        finally block. Safe to call repeatedly; already-grabbed devices are
-        skipped.
+        text injected (and anything the user presses during the wait) cannot
+        corrupt the output. Must be paired with ungrab_all(). Safe to call
+        repeatedly; already-grabbed devices are skipped.
+
+        Prefer arm_grab() when the user may still be holding the hotkey;
+        calling this directly while a modifier is held can strand its release.
         """
         for device in self._devices:
             if device in self._grabbed:
@@ -331,11 +369,12 @@ class HotkeyManager(QObject):
                 logger.warning(f"Failed to grab {device.path}: {e}")
 
     def ungrab_all(self) -> None:
-        """Release exclusive access to any grabbed keyboards.
+        """Release exclusive access to any grabbed keyboards and disarm.
 
-        Safe to call when nothing is grabbed (used as an idempotent safety
-        net on cleanup and at interpreter exit).
+        Safe to call when nothing is grabbed or armed (used as an idempotent
+        safety net on cleanup, watchdog timeout, and interpreter exit).
         """
+        self._grab_armed = False
         if not self._grabbed:
             return
         for device in self._grabbed:

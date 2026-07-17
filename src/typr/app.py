@@ -21,29 +21,25 @@ class TypingWorker(QThread):
 
     type_text() sleeps between keystrokes, so running it on the Qt main
     thread freezes the tray UI for the duration of a long transcription.
-    This worker also wraps the injection in grab -> reset-modifiers ->
-    type -> ungrab so the user's physical keyboard can't corrupt the
-    output, with ungrab guaranteed in a finally block.
+    The keyboard grab is owned by the app state machine (armed when recording
+    stops, released when we return to IDLE/ERROR), so this worker only resets
+    any latched modifiers and types.
     """
 
     finished = pyqtSignal(bool)  # success
 
-    def __init__(self, injector, hotkey_manager, text: str, parent: Optional[QObject] = None):
+    def __init__(self, injector, text: str, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._injector = injector
-        self._hotkey_manager = hotkey_manager
         self._text = text
 
     def run(self) -> None:
         success = False
         try:
-            self._hotkey_manager.grab_all()
             self._injector.reset_modifiers()
             success = self._injector.type_text(self._text)
         except Exception as e:
             logger.error(f"Text injection failed: {e}")
-        finally:
-            self._hotkey_manager.ungrab_all()
         self.finished.emit(success)
 
 
@@ -116,6 +112,14 @@ class TyprApp(QObject):
 
         # Let the tray populate its "Previous Outputs" submenu on demand.
         self.tray_icon.set_outputs_provider(self._recent_outputs)
+
+        # Safety watchdog: force-release the keyboard grab if it is ever held
+        # too long (e.g. a hung transcription), so the keyboard can never get
+        # stuck grabbed. Generous interval; normal flow ungrabs well before.
+        self._grab_watchdog = QTimer(self)
+        self._grab_watchdog.setSingleShot(True)
+        self._grab_watchdog.setInterval(30000)
+        self._grab_watchdog.timeout.connect(self._on_grab_watchdog)
 
     def _connect_signals(self) -> None:
         """Connect all component signals."""
@@ -230,12 +234,11 @@ class TyprApp(QObject):
         self._record_history(text)
         self._set_state(AppState.TYPING)
 
-        # Type the text on a background thread. The worker grabs the
-        # keyboard, resets modifiers, types, then ungrabs (see TypingWorker)
-        # so injection can't be corrupted by keys the user is pressing, and
-        # the GUI thread stays responsive while typing.
+        # Type the text on a background thread so the GUI stays responsive.
+        # The keyboard is already grabbed (armed when recording stopped); the
+        # grab is released when we return to IDLE/ERROR in _set_state.
         self._typing_text = text
-        self._typing_worker = TypingWorker(self.text_injector, self.hotkey_manager, text)
+        self._typing_worker = TypingWorker(self.text_injector, text)
         self._typing_worker.finished.connect(self._on_typing_finished)
         self._typing_worker.start()
 
@@ -353,6 +356,18 @@ class TyprApp(QObject):
 
         logger.debug(f"State: {old_state.name} -> {state.name}")
 
+        # Keyboard grab lifecycle. Arm the grab the moment recording stops so
+        # the whole vulnerable window (transcription wait + injection) is
+        # protected, but arm_grab() defers the actual grab until the hotkey is
+        # fully released so its modifiers can't get stranded. Release on any
+        # return to IDLE/ERROR, and run a watchdog so it can never stick.
+        if state == AppState.TRANSCRIBING and old_state != AppState.TRANSCRIBING:
+            self.hotkey_manager.arm_grab()
+            self._grab_watchdog.start()
+        elif state in (AppState.IDLE, AppState.ERROR):
+            self._grab_watchdog.stop()
+            self.hotkey_manager.ungrab_all()
+
         # Map to tray states
         tray_state = {
             AppState.IDLE: TrayState.IDLE,
@@ -370,6 +385,12 @@ class TyprApp(QObject):
             if message:
                 self.tray_icon.show_error(message)
             QTimer.singleShot(3000, self._recover_from_error)
+
+    @pyqtSlot()
+    def _on_grab_watchdog(self) -> None:
+        """Force-release the keyboard grab if it was held too long."""
+        logger.warning("Grab watchdog fired - force-releasing keyboard")
+        self.hotkey_manager.ungrab_all()
 
     @pyqtSlot()
     def _recover_from_error(self) -> None:
