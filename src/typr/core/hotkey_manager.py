@@ -65,6 +65,7 @@ class HotkeyManager(QObject):
     # Signals
     recording_started = pyqtSignal()
     recording_stopped = pyqtSignal()
+    copy_last_requested = pyqtSignal()
     hotkey_error = pyqtSignal(str)
 
     def __init__(self, config: Optional[HotkeyConfig] = None, parent: Optional[QObject] = None):
@@ -76,11 +77,6 @@ class HotkeyManager(QObject):
         self._running = False
         self._registered = False
 
-        # All physically-held key codes, so we can tell when the keyboard is
-        # idle. Used to defer an armed grab until the hotkey is fully released.
-        self._pressed_keys: set[int] = set()
-        self._grab_armed = False
-
         # Safety net: if the process exits while keyboards are grabbed,
         # release them so the user isn't locked out. (A hard crash closes
         # the fds and the kernel auto-releases the grab anyway, but this
@@ -90,40 +86,57 @@ class HotkeyManager(QObject):
         # Current modifier state
         self._modifiers: set[str] = set()
 
-        # Parse the configured hotkey
+        # Parse the configured hotkeys
         self._target_modifiers: set[str] = set()
         self._target_key: int = 0
         self._key_pressed = False
 
-        self._parse_hotkey(self.config.push_to_talk)
+        # Copy-last-output hotkey (discrete press, not push-to-talk)
+        self._copy_modifiers: set[str] = set()
+        self._copy_key: int = 0
+        self._copy_pressed = False
 
-    def _parse_hotkey(self, hotkey_str: str) -> None:
-        """Parse hotkey string like 'Meta+Shift+Space' into components."""
-        parts = hotkey_str.lower().replace(" ", "").split("+")
+        self._reparse_hotkeys()
 
-        self._target_modifiers = set()
-        self._target_key = 0
+    def _reparse_hotkeys(self) -> None:
+        """(Re)parse all configured hotkeys from the current config."""
+        self._target_modifiers, self._target_key = self._parse_combo(self.config.push_to_talk)
+        logger.info(
+            f"Parsed push-to-talk: modifiers={self._target_modifiers}, key={self._target_key}"
+        )
+        self._copy_modifiers, self._copy_key = self._parse_combo(self.config.copy_last)
+        logger.info(
+            f"Parsed copy-last: modifiers={self._copy_modifiers}, key={self._copy_key}"
+        )
 
-        for part in parts:
+    @staticmethod
+    def _parse_combo(hotkey_str: str) -> tuple[set[str], int]:
+        """Parse a hotkey string like 'Meta+Shift+Space' into (modifiers, key)."""
+        modifiers: set[str] = set()
+        key = 0
+
+        if not hotkey_str:
+            return modifiers, key
+
+        for part in hotkey_str.lower().replace(" ", "").split("+"):
             if part in ("meta", "super", "win"):
-                self._target_modifiers.add("meta")
+                modifiers.add("meta")
             elif part in ("shift",):
-                self._target_modifiers.add("shift")
+                modifiers.add("shift")
             elif part in ("ctrl", "control"):
-                self._target_modifiers.add("ctrl")
+                modifiers.add("ctrl")
             elif part in ("alt",):
-                self._target_modifiers.add("alt")
+                modifiers.add("alt")
             elif part in KEY_NAMES:
-                self._target_key = KEY_NAMES[part]
+                key = KEY_NAMES[part]
             elif len(part) == 1 and part.isalpha():
                 # Single letter key
                 if EVDEV_AVAILABLE:
-                    key_name = f"KEY_{part.upper()}"
-                    self._target_key = getattr(ecodes, key_name, 0)
+                    key = getattr(ecodes, f"KEY_{part.upper()}", 0)
             else:
                 logger.warning(f"Unknown key in hotkey: {part}")
 
-        logger.info(f"Parsed hotkey: modifiers={self._target_modifiers}, key={self._target_key}")
+        return modifiers, key
 
     def initialize(self) -> bool:
         """Initialize evdev keyboard listeners.
@@ -248,18 +261,6 @@ class HotkeyManager(QObject):
         key_code = event.code
         key_state = event.value  # 0=release, 1=press, 2=repeat
 
-        # Track every physically-held key so we know when the keyboard is
-        # idle. A grab armed while the hotkey is still being released is
-        # deferred until here, the moment the last key comes up — by then the
-        # compositor has already seen those release events, so grabbing can't
-        # strand them (which is what previously left modifiers stuck down).
-        if key_state in (1, 2):
-            self._pressed_keys.add(key_code)
-        elif key_state == 0:
-            self._pressed_keys.discard(key_code)
-            if self._grab_armed and not self._pressed_keys:
-                self._do_armed_grab()
-
         # Update modifier state
         if key_code in MODIFIER_KEYS:
             modifier = MODIFIER_KEYS[key_code]
@@ -291,45 +292,34 @@ class HotkeyManager(QObject):
                     logger.debug("Hotkey released")
                     self.recording_stopped.emit()
 
+        # Check for the copy-last-output key (discrete press trigger)
+        if self._copy_key and key_code == self._copy_key:
+            if key_state == 1:  # Press
+                if self._copy_modifiers <= self._modifiers and not self._copy_pressed:
+                    self._copy_pressed = True
+                    logger.debug("Copy-last hotkey pressed")
+                    self.copy_last_requested.emit()
+            elif key_state == 0:  # Release
+                self._copy_pressed = False
+
     def update_shortcut(self, shortcut: str) -> bool:
         """Update the push-to-talk shortcut."""
         self.config.push_to_talk = shortcut
-        self._parse_hotkey(shortcut)
+        self._reparse_hotkeys()
         return True
 
     def is_registered(self) -> bool:
         """Check if hotkeys are registered."""
         return self._registered
 
-    def arm_grab(self) -> None:
-        """Grab the keyboard as soon as it is physically idle.
-
-        Deferring until no keys are held is what makes grabbing safe with a
-        modifier-combo push-to-talk hotkey: grabbing mid-release would swallow
-        the hotkey's own Ctrl/Alt release events and leave them stuck down.
-        If the keyboard is already idle, grabs immediately; otherwise the grab
-        happens in _handle_key_event when the last key is released.
-        """
-        self._grab_armed = True
-        if not self._pressed_keys:
-            self._do_armed_grab()
-
-    def _do_armed_grab(self) -> None:
-        """Perform a previously armed grab and disarm."""
-        self._grab_armed = False
-        if not self._grabbed:
-            self.grab_all()
-
     def grab_all(self) -> None:
         """Take exclusive access to all physical keyboards.
 
         While grabbed, physical key events do not reach the compositor, so
-        text injected (and anything the user presses during the wait) cannot
-        corrupt the output. Must be paired with ungrab_all(). Safe to call
-        repeatedly; already-grabbed devices are skipped.
-
-        Prefer arm_grab() when the user may still be holding the hotkey;
-        calling this directly while a modifier is held can strand its release.
+        text injected immediately afterwards cannot be corrupted by keys the
+        user happens to be pressing. Must be paired with ungrab_all() in a
+        finally block. Safe to call repeatedly; already-grabbed devices are
+        skipped.
         """
         for device in self._devices:
             if device in self._grabbed:
@@ -341,12 +331,11 @@ class HotkeyManager(QObject):
                 logger.warning(f"Failed to grab {device.path}: {e}")
 
     def ungrab_all(self) -> None:
-        """Release exclusive access to any grabbed keyboards and disarm.
+        """Release exclusive access to any grabbed keyboards.
 
-        Safe to call when nothing is grabbed or armed (used as an idempotent
-        safety net on cleanup, watchdog timeout, and interpreter exit).
+        Safe to call when nothing is grabbed (used as an idempotent safety
+        net on cleanup and at interpreter exit).
         """
-        self._grab_armed = False
         if not self._grabbed:
             return
         for device in self._grabbed:

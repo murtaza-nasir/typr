@@ -21,25 +21,29 @@ class TypingWorker(QThread):
 
     type_text() sleeps between keystrokes, so running it on the Qt main
     thread freezes the tray UI for the duration of a long transcription.
-    The keyboard grab is owned by the app state machine (armed when recording
-    stops, released when we return to IDLE/ERROR), so this worker only resets
-    any latched modifiers and types.
+    This worker also wraps the injection in grab -> reset-modifiers ->
+    type -> ungrab so the user's physical keyboard can't corrupt the
+    output, with ungrab guaranteed in a finally block.
     """
 
     finished = pyqtSignal(bool)  # success
 
-    def __init__(self, injector, text: str, parent: Optional[QObject] = None):
+    def __init__(self, injector, hotkey_manager, text: str, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._injector = injector
+        self._hotkey_manager = hotkey_manager
         self._text = text
 
     def run(self) -> None:
         success = False
         try:
+            self._hotkey_manager.grab_all()
             self._injector.reset_modifiers()
             success = self._injector.type_text(self._text)
         except Exception as e:
             logger.error(f"Text injection failed: {e}")
+        finally:
+            self._hotkey_manager.ungrab_all()
         self.finished.emit(success)
 
 
@@ -107,19 +111,18 @@ class TyprApp(QObject):
         self._typing_worker: Optional[TypingWorker] = None
         self._typing_text: str = ""
 
-        # Safety watchdog: force-release the keyboard grab if it is ever held
-        # too long (e.g. a hung transcription), so the keyboard can never get
-        # stuck grabbed. Generous interval; normal flow ungrabs well before.
-        self._grab_watchdog = QTimer(self)
-        self._grab_watchdog.setSingleShot(True)
-        self._grab_watchdog.setInterval(30000)
-        self._grab_watchdog.timeout.connect(self._on_grab_watchdog)
+        # Most recent transcription, for the copy-last hotkey / tray menu
+        self._last_output: str = ""
+
+        # Let the tray populate its "Previous Outputs" submenu on demand.
+        self.tray_icon.set_outputs_provider(self._recent_outputs)
 
     def _connect_signals(self) -> None:
         """Connect all component signals."""
         # Hotkey -> Recording
         self.hotkey_manager.recording_started.connect(self._on_recording_start)
         self.hotkey_manager.recording_stopped.connect(self._on_recording_stop)
+        self.hotkey_manager.copy_last_requested.connect(self._on_copy_last)
         self.hotkey_manager.hotkey_error.connect(self._on_hotkey_error)
 
         # Audio -> Transcription
@@ -135,6 +138,7 @@ class TyprApp(QObject):
         self.tray_icon.history_requested.connect(self._show_history)
         self.tray_icon.quit_requested.connect(self._quit)
         self.tray_icon.record_toggled.connect(self._on_record_toggled)
+        self.tray_icon.output_selected.connect(self._on_output_selected)
 
     @pyqtSlot(bool)
     def _on_record_toggled(self, start: bool) -> None:
@@ -222,14 +226,16 @@ class TyprApp(QObject):
             return
 
         logger.info(f"Transcription: {text[:50]}...")
+        self._last_output = text
         self._record_history(text)
         self._set_state(AppState.TYPING)
 
-        # Type the text on a background thread so the GUI stays responsive.
-        # The keyboard is already grabbed (armed when recording stopped); the
-        # grab is released when we return to IDLE/ERROR in _set_state.
+        # Type the text on a background thread. The worker grabs the
+        # keyboard, resets modifiers, types, then ungrabs (see TypingWorker)
+        # so injection can't be corrupted by keys the user is pressing, and
+        # the GUI thread stays responsive while typing.
         self._typing_text = text
-        self._typing_worker = TypingWorker(self.text_injector, text)
+        self._typing_worker = TypingWorker(self.text_injector, self.hotkey_manager, text)
         self._typing_worker.finished.connect(self._on_typing_finished)
         self._typing_worker.start()
 
@@ -256,6 +262,55 @@ class TyprApp(QObject):
         if self._typing_worker:
             self._typing_worker.deleteLater()
             self._typing_worker = None
+
+    def _recent_outputs(self, limit: int = 10) -> list[str]:
+        """Return the most recent output texts, newest first.
+
+        Backed by history when available; falls back to the last output so
+        the menu still works even if history persistence is disabled.
+        """
+        texts = [entry.text for entry in self.history.entries()[:limit]]
+        if not texts and self._last_output:
+            texts = [self._last_output]
+        return texts
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Copy text to the system clipboard."""
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
+    @pyqtSlot()
+    def _on_copy_last(self) -> None:
+        """Copy the most recent output to the clipboard (from hotkey)."""
+        outputs = self._recent_outputs(limit=1)
+        if not outputs:
+            logger.debug("Copy-last requested but no output available")
+            return
+
+        text = outputs[0]
+        self._copy_to_clipboard(text)
+        logger.info("Copied last output to clipboard")
+        if self.config.ui.show_notifications:
+            self.tray_icon.show_notification(
+                "Copied to Clipboard",
+                text[:100] + ("..." if len(text) > 100 else ""),
+                self.tray_icon.MessageIcon.Information,
+                self.config.ui.notification_duration,
+            )
+
+    @pyqtSlot(str)
+    def _on_output_selected(self, text: str) -> None:
+        """Copy a previous output chosen from the tray menu."""
+        self._copy_to_clipboard(text)
+        logger.info("Copied selected output to clipboard")
+        if self.config.ui.show_notifications:
+            self.tray_icon.show_notification(
+                "Copied to Clipboard",
+                text[:100] + ("..." if len(text) > 100 else ""),
+                self.tray_icon.MessageIcon.Information,
+                self.config.ui.notification_duration,
+            )
 
     def _record_history(self, text: str) -> None:
         """Persist a completed transcription to history if enabled."""
@@ -298,18 +353,6 @@ class TyprApp(QObject):
 
         logger.debug(f"State: {old_state.name} -> {state.name}")
 
-        # Keyboard grab lifecycle. Arm the grab the moment recording stops so
-        # the whole vulnerable window (transcription wait + injection) is
-        # protected, but arm_grab() defers the actual grab until the hotkey is
-        # fully released so its modifiers can't get stranded. Release on any
-        # return to IDLE/ERROR, and run a watchdog so it can never stick.
-        if state == AppState.TRANSCRIBING and old_state != AppState.TRANSCRIBING:
-            self.hotkey_manager.arm_grab()
-            self._grab_watchdog.start()
-        elif state in (AppState.IDLE, AppState.ERROR):
-            self._grab_watchdog.stop()
-            self.hotkey_manager.ungrab_all()
-
         # Map to tray states
         tray_state = {
             AppState.IDLE: TrayState.IDLE,
@@ -327,12 +370,6 @@ class TyprApp(QObject):
             if message:
                 self.tray_icon.show_error(message)
             QTimer.singleShot(3000, self._recover_from_error)
-
-    @pyqtSlot()
-    def _on_grab_watchdog(self) -> None:
-        """Force-release the keyboard grab if it was held too long."""
-        logger.warning("Grab watchdog fired - force-releasing keyboard")
-        self.hotkey_manager.ungrab_all()
 
     @pyqtSlot()
     def _recover_from_error(self) -> None:

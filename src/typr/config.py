@@ -42,6 +42,7 @@ class HotkeyConfig:
 
     push_to_talk: str = "Meta+Shift+Space"
     cancel_recording: str = "Escape"
+    copy_last: str = "Meta+Shift+C"  # Copy last transcription to clipboard
 
 
 @dataclass

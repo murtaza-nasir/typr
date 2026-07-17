@@ -1,13 +1,21 @@
 """System tray icon for Typr."""
 
 from enum import Enum, auto
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from typr.utils.logger import logger
+
+
+def _truncate_output(text: str, length: int = 60) -> str:
+    """Collapse whitespace and shorten text for a menu label."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) > length:
+        collapsed = collapsed[: length - 1].rstrip() + "…"
+    return collapsed or "(empty)"
 
 
 class TrayState(Enum):
@@ -28,6 +36,7 @@ class TrayIcon(QSystemTrayIcon):
     quit_requested = pyqtSignal()
     toggle_mode = pyqtSignal()
     record_toggled = pyqtSignal(bool)  # True = start, False = stop
+    output_selected = pyqtSignal(str)  # Full text of a chosen previous output
 
     # State colors for icon generation
     STATE_COLORS = {
@@ -50,6 +59,9 @@ class TrayIcon(QSystemTrayIcon):
         self._hotkey = hotkey
         self._mode = "push_to_talk"
         self._status_message = "Ready"
+
+        # Callable returning the recent output texts (newest first).
+        self._outputs_provider: Optional[Callable[[], list[str]]] = None
 
         self._setup_icons()
         self._setup_menu()
@@ -117,6 +129,12 @@ class TrayIcon(QSystemTrayIcon):
 
         menu.addSeparator()
 
+        # Previous outputs - rebuilt each time the menu opens
+        self._outputs_menu = QMenu("Previous Outputs", menu)
+        self._outputs_menu.setToolTipsVisible(True)
+        self._outputs_menu.aboutToShow.connect(self._populate_outputs_menu)
+        menu.addMenu(self._outputs_menu)
+
         # History
         history_action = QAction("History...", menu)
         history_action.triggered.connect(self.history_requested.emit)
@@ -138,6 +156,32 @@ class TrayIcon(QSystemTrayIcon):
 
         # Also trigger on left click
         self.activated.connect(self._on_activated)
+
+    def set_outputs_provider(self, provider: Callable[[], list[str]]) -> None:
+        """Set the callback used to fetch recent output texts (newest first)."""
+        self._outputs_provider = provider
+
+    def _populate_outputs_menu(self) -> None:
+        """Rebuild the 'Previous Outputs' submenu from the current outputs."""
+        menu = self._outputs_menu
+        menu.clear()
+
+        outputs = self._outputs_provider() if self._outputs_provider else []
+
+        if not outputs:
+            empty = QAction("No outputs yet", menu)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+            return
+
+        for text in outputs:
+            action = QAction(_truncate_output(text), menu)
+            action.setToolTip(text)
+            # Bind the full text per-action so clicking copies the original.
+            action.triggered.connect(
+                lambda _checked=False, t=text: self.output_selected.emit(t)
+            )
+            menu.addAction(action)
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         """Handle tray icon activation (click)."""
