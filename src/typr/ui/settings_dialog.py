@@ -3,7 +3,6 @@
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -12,7 +11,6 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -26,6 +24,88 @@ from PyQt6.QtWidgets import (
 
 from typr.config import AppConfig
 from typr.utils.logger import logger
+
+
+class HotkeyCaptureButton(QPushButton):
+    """Button that records a global shortcut via the evdev hotkey manager.
+
+    Qt's own QKeySequenceEdit is useless here: the app reads the keyboard
+    through evdev, so pressing the current push-to-talk combo just starts a
+    recording instead of landing in the widget, and on Wayland the dialog may
+    not receive key events at all. Clicking this button puts the hotkey
+    manager into capture mode, so the next combo is read from the same evdev
+    stream the hotkeys run on.
+    """
+
+    def __init__(self, hotkey_manager=None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._hotkey_manager = hotkey_manager
+        self._shortcut = ""
+        self._capturing = False
+        self.setCheckable(True)
+        self.clicked.connect(self._on_clicked)
+        self._update_text()
+
+    def set_shortcut(self, shortcut: str) -> None:
+        """Set the displayed shortcut."""
+        self._shortcut = shortcut or ""
+        self._update_text()
+
+    def shortcut_string(self) -> str:
+        """Return the currently displayed shortcut."""
+        return self._shortcut
+
+    def _update_text(self) -> None:
+        if self._capturing:
+            self.setText("Press a key combination... (Esc to cancel)")
+        else:
+            self.setText(self._shortcut or "Not set - click to record")
+
+    def _on_clicked(self) -> None:
+        if self._capturing:
+            self._cancel_capture()
+            return
+
+        if self._hotkey_manager is None:
+            self.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "Hotkeys Unavailable",
+                "The hotkey listener is not running, so shortcuts cannot be recorded.",
+            )
+            return
+
+        self._capturing = True
+        self.setChecked(True)
+        self._update_text()
+        self._hotkey_manager.hotkey_captured.connect(self._on_captured)
+        self._hotkey_manager.start_capture()
+
+    def _cancel_capture(self) -> None:
+        if not self._capturing:
+            return
+        if self._hotkey_manager is not None:
+            self._hotkey_manager.stop_capture()
+            try:
+                self._hotkey_manager.hotkey_captured.disconnect(self._on_captured)
+            except TypeError:
+                pass
+        self._capturing = False
+        self.setChecked(False)
+        self._update_text()
+
+    def _on_captured(self, shortcut: str) -> None:
+        captured = shortcut
+        self._cancel_capture()
+        if captured:
+            self._shortcut = captured
+            self._update_text()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        # Never leave the manager stuck in capture mode if the dialog closes
+        # mid-capture - that would disable the real hotkeys.
+        self._cancel_capture()
+        super().hideEvent(event)
 
 
 class SettingsDialog(QDialog):
@@ -57,9 +137,15 @@ class SettingsDialog(QDialog):
         ("hi", "Hindi"),
     ]
 
-    def __init__(self, config: AppConfig, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        hotkey_manager=None,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.config = config
+        self._hotkey_manager = hotkey_manager
         self._setup_ui()
         self._load_settings()
 
@@ -216,19 +302,20 @@ class SettingsDialog(QDialog):
         hotkey_layout = QFormLayout(hotkey_group)
 
         # Push-to-talk hotkey
-        self._ptt_hotkey_edit = QKeySequenceEdit()
-        hotkey_layout.addRow("Push-to-Talk:", self._ptt_hotkey_edit)
+        self._ptt_hotkey_btn = HotkeyCaptureButton(self._hotkey_manager)
+        hotkey_layout.addRow("Push-to-Talk:", self._ptt_hotkey_btn)
 
-        # Cancel hotkey
-        self._cancel_hotkey_edit = QKeySequenceEdit()
-        hotkey_layout.addRow("Cancel Recording:", self._cancel_hotkey_edit)
+        # Copy-last-output hotkey
+        self._copy_hotkey_btn = HotkeyCaptureButton(self._hotkey_manager)
+        hotkey_layout.addRow("Copy Last Output:", self._copy_hotkey_btn)
 
         layout.addWidget(hotkey_group)
 
         # Info
         info_label = QLabel(
-            "Note: Hotkeys are registered with KDE's global shortcut system. "
-            "You can also configure them in System Settings > Shortcuts."
+            "Click a shortcut to record a new one, then press the key combination "
+            "you want (Esc cancels). Hotkeys are read directly from the keyboard, "
+            "so they work in any window - pick a combination other apps do not use."
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -367,12 +454,8 @@ class SettingsDialog(QDialog):
         self._typing_delay_spin.setValue(self.config.ui.typing_delay)
 
         # Hotkeys
-        self._ptt_hotkey_edit.setKeySequence(
-            QKeySequence.fromString(self.config.hotkeys.push_to_talk)
-        )
-        self._cancel_hotkey_edit.setKeySequence(
-            QKeySequence.fromString(self.config.hotkeys.cancel_recording)
-        )
+        self._ptt_hotkey_btn.set_shortcut(self.config.hotkeys.push_to_talk)
+        self._copy_hotkey_btn.set_shortcut(self.config.hotkeys.copy_last)
 
         # Audio device
         device_index = self._device_combo.findData(self.config.audio.input_device)
@@ -401,13 +484,13 @@ class SettingsDialog(QDialog):
         self.config.ui.typing_delay = self._typing_delay_spin.value()
 
         # Hotkeys
-        ptt_seq = self._ptt_hotkey_edit.keySequence()
-        if not ptt_seq.isEmpty():
-            self.config.hotkeys.push_to_talk = ptt_seq.toString()
+        ptt = self._ptt_hotkey_btn.shortcut_string()
+        if ptt:
+            self.config.hotkeys.push_to_talk = ptt
 
-        cancel_seq = self._cancel_hotkey_edit.keySequence()
-        if not cancel_seq.isEmpty():
-            self.config.hotkeys.cancel_recording = cancel_seq.toString()
+        copy_last = self._copy_hotkey_btn.shortcut_string()
+        if copy_last:
+            self.config.hotkeys.copy_last = copy_last
 
         # Audio
         self.config.audio.input_device = self._device_combo.currentData()

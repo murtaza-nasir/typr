@@ -404,7 +404,7 @@ class TyprApp(QObject):
         from typr.ui.settings_dialog import SettingsDialog
 
         if self._settings_dialog is None:
-            self._settings_dialog = SettingsDialog(self.config)
+            self._settings_dialog = SettingsDialog(self.config, self.hotkey_manager)
             self._settings_dialog.settings_saved.connect(self._on_settings_saved)
 
         self._settings_dialog.show()
@@ -441,8 +441,8 @@ class TyprApp(QObject):
         self.tray_icon.set_mode(self.config.transcription.mode)
         self.history.set_max_entries(self.config.history.max_entries)
 
-        # Re-register hotkey if changed
-        self.hotkey_manager.update_shortcut(self.config.hotkeys.push_to_talk)
+        # Re-register hotkeys if changed
+        self.hotkey_manager.update_hotkeys(self.config.hotkeys)
 
     @pyqtSlot()
     def _quit(self) -> None:

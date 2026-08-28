@@ -67,6 +67,9 @@ class HotkeyManager(QObject):
     recording_stopped = pyqtSignal()
     copy_last_requested = pyqtSignal()
     hotkey_error = pyqtSignal(str)
+    # Emitted with a combo string (e.g. "Ctrl+Alt+D") while in capture mode,
+    # or an empty string if the capture was cancelled.
+    hotkey_captured = pyqtSignal(str)
 
     def __init__(self, config: Optional[HotkeyConfig] = None, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -101,6 +104,10 @@ class HotkeyManager(QObject):
         self._copy_key: int = 0
         self._copy_pressed = False
 
+        # Capture mode: while active, key events are used to record a new
+        # combo for the settings dialog instead of triggering any action.
+        self._capturing = False
+
         self._reparse_hotkeys()
 
     def _reparse_hotkeys(self) -> None:
@@ -134,14 +141,45 @@ class HotkeyManager(QObject):
                 modifiers.add("alt")
             elif part in KEY_NAMES:
                 key = KEY_NAMES[part]
-            elif len(part) == 1 and part.isalpha():
-                # Single letter key
-                if EVDEV_AVAILABLE:
-                    key = getattr(ecodes, f"KEY_{part.upper()}", 0)
+            elif EVDEV_AVAILABLE and getattr(ecodes, f"KEY_{part.upper()}", 0):
+                # Letters, digits and any other evdev key name (KEY_COMMA, ...)
+                key = getattr(ecodes, f"KEY_{part.upper()}")
             else:
                 logger.warning(f"Unknown key in hotkey: {part}")
 
         return modifiers, key
+
+    @staticmethod
+    def _format_combo(modifiers: set[str], key_code: int) -> str:
+        """Render (modifiers, key code) back into a string like 'Ctrl+Alt+D'."""
+        parts = [
+            label
+            for name, label in (
+                ("ctrl", "Ctrl"),
+                ("alt", "Alt"),
+                ("shift", "Shift"),
+                ("meta", "Meta"),
+            )
+            if name in modifiers
+        ]
+
+        key_name = ""
+        for name, code in KEY_NAMES.items():
+            if code == key_code:
+                key_name = name.capitalize()
+                break
+        if not key_name and EVDEV_AVAILABLE:
+            evdev_name = ecodes.KEY.get(key_code)
+            if isinstance(evdev_name, list):
+                evdev_name = evdev_name[0]
+            if evdev_name:
+                key_name = evdev_name[len("KEY_"):].capitalize()
+
+        if not key_name:
+            return ""
+
+        parts.append(key_name)
+        return "+".join(parts)
 
     def initialize(self) -> bool:
         """Initialize evdev keyboard listeners.
@@ -278,6 +316,11 @@ class HotkeyManager(QObject):
             if self._grab_armed and not self._pressed_keys:
                 self._do_armed_grab()
 
+        # In capture mode the keyboard is only used to record a new combo.
+        if self._capturing:
+            self._handle_capture_event(key_code, key_state)
+            return
+
         # Update modifier state
         if key_code in MODIFIER_KEYS:
             modifier = MODIFIER_KEYS[key_code]
@@ -319,11 +362,67 @@ class HotkeyManager(QObject):
             elif key_state == 0:  # Release
                 self._copy_pressed = False
 
+    def _handle_capture_event(self, key_code: int, key_state: int) -> None:
+        """Build a combo from raw key events while capture mode is active."""
+        if key_code in MODIFIER_KEYS:
+            # Track modifiers in both directions so a released modifier does
+            # not end up in the captured combo.
+            if key_state == 1:
+                self._modifiers.add(MODIFIER_KEYS[key_code])
+            elif key_state == 0:
+                self._modifiers.discard(MODIFIER_KEYS[key_code])
+            return
+
+        if key_state != 1:  # Otherwise only act on presses
+            return
+
+        if key_code == KEY_NAMES["escape"] and not self._modifiers:
+            # Bare Escape cancels the capture.
+            self.stop_capture()
+            self.hotkey_captured.emit("")
+            return
+
+        combo = self._format_combo(self._modifiers, key_code)
+        self.stop_capture()
+        if combo:
+            self.hotkey_captured.emit(combo)
+        else:
+            logger.warning(f"Unrecognized key code during capture: {key_code}")
+            self.hotkey_captured.emit("")
+
+    def start_capture(self) -> None:
+        """Listen for the next key combo instead of triggering hotkeys.
+
+        The settings dialog uses this so a new shortcut can be recorded from
+        the same evdev stream the hotkeys themselves run on - Qt never sees
+        these presses reliably, and without this the old push-to-talk combo
+        would just start recording while you tried to rebind it.
+        """
+        self._capturing = True
+        # Any in-flight hotkey state is meaningless once we switch modes.
+        self._key_pressed = False
+        self._copy_pressed = False
+        self._modifiers.clear()
+
+    def stop_capture(self) -> None:
+        """Leave capture mode and resume normal hotkey handling."""
+        self._capturing = False
+        self._modifiers.clear()
+
+    def is_capturing(self) -> bool:
+        """Whether capture mode is currently active."""
+        return self._capturing
+
     def update_shortcut(self, shortcut: str) -> bool:
         """Update the push-to-talk shortcut."""
         self.config.push_to_talk = shortcut
         self._reparse_hotkeys()
         return True
+
+    def update_hotkeys(self, config: HotkeyConfig) -> None:
+        """Adopt a new hotkey config and reparse every combo."""
+        self.config = config
+        self._reparse_hotkeys()
 
     def is_registered(self) -> bool:
         """Check if hotkeys are registered."""
