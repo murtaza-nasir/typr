@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QApplication
 
 from typr.config import AppConfig
 from typr.core.audio_recorder import AudioRecorder
+from typr.core.failed_audio import FailedAudioStore
 from typr.core.history import HistoryEntry, HistoryManager
 from typr.core.hotkey_manager import HotkeyManager
 from typr.core.text_injector import TextInjector
@@ -89,11 +90,26 @@ class TyprApp(QObject):
         self.transcriber.language = self.config.transcription.language
         self.transcriber.prompt = self.config.transcription.prompt
 
+        # Separate transcriber for retrying saved recordings, so a retry never
+        # touches the record/type state machine or the keyboard grab.
+        self.retry_transcriber = WhisperTranscriber(
+            api_key=self.config.api_key,
+            api_base_url=self.config.api_base_url,
+            model=self.config.transcription.model,
+        )
+        self.retry_transcriber.language = self.config.transcription.language
+        self.retry_transcriber.prompt = self.config.transcription.prompt
+
         self.text_injector = TextInjector(self.config.ui.typing_delay)
         self.hotkey_manager = HotkeyManager(self.config.hotkeys)
 
         # History
         self.history = HistoryManager(self.config.history.max_entries)
+
+        # Recordings whose transcription failed, kept on disk for retry
+        self.failed_audio = FailedAudioStore()
+        self._last_audio: bytes = b""
+        self._retrying_clip_id: Optional[str] = None
 
         # UI components
         self.tray_icon = TrayIcon(self.config.hotkeys.push_to_talk)
@@ -112,6 +128,7 @@ class TyprApp(QObject):
 
         # Let the tray populate its "Previous Outputs" submenu on demand.
         self.tray_icon.set_outputs_provider(self._recent_outputs)
+        self.tray_icon.set_failed_provider(self._failed_clip_items)
 
         # Safety watchdog: force-release the keyboard grab if it is ever held
         # too long (e.g. a hung transcription), so the keyboard can never get
@@ -135,7 +152,11 @@ class TyprApp(QObject):
 
         # Transcription -> Text injection
         self.transcriber.transcription_complete.connect(self._on_transcription_complete)
-        self.transcriber.transcription_error.connect(self._on_error)
+        self.transcriber.transcription_error.connect(self._on_transcription_error)
+
+        # Retries of saved recordings
+        self.retry_transcriber.transcription_complete.connect(self._on_retry_complete)
+        self.retry_transcriber.transcription_error.connect(self._on_retry_error)
 
         # UI
         self.tray_icon.settings_requested.connect(self._show_settings)
@@ -143,6 +164,8 @@ class TyprApp(QObject):
         self.tray_icon.quit_requested.connect(self._quit)
         self.tray_icon.record_toggled.connect(self._on_record_toggled)
         self.tray_icon.output_selected.connect(self._on_output_selected)
+        self.tray_icon.retry_requested.connect(self._on_retry_requested)
+        self.tray_icon.clear_failed_requested.connect(self.failed_audio.clear)
 
     @pyqtSlot(bool)
     def _on_record_toggled(self, start: bool) -> None:
@@ -219,11 +242,13 @@ class TyprApp(QObject):
             return
 
         logger.info(f"Audio ready: {len(audio_data)} bytes")
+        self._last_audio = audio_data
         self.transcriber.transcribe(audio_data)
 
     @pyqtSlot(str)
     def _on_transcription_complete(self, text: str) -> None:
         """Handle completed transcription."""
+        self._last_audio = b""
         if not text or not text.strip():
             logger.info("Empty transcription result")
             self._set_state(AppState.IDLE)
@@ -334,6 +359,90 @@ class TyprApp(QObject):
         self._set_state(AppState.ERROR, message)
 
     @pyqtSlot(str)
+    def _on_transcription_error(self, message: str) -> None:
+        """Save the recording for later retry, then enter the error state."""
+        if self._last_audio and self.failed_audio.add(self._last_audio, message):
+            message = f"{message} (recording saved, retry from the tray menu)"
+        self._last_audio = b""
+        self._on_error(message)
+
+    def _failed_clip_items(self) -> list[tuple[str, str, str]]:
+        """Failed recordings as (id, menu label, tooltip) for the tray menu."""
+        items = []
+        for clip in self.failed_audio.clips():
+            label = f"{clip.datetime():%b %d %H:%M} ({clip.duration_s:.0f}s)"
+            if clip.id == self._retrying_clip_id:
+                label += " - retrying..."
+            tooltip = f"Last error: {clip.error}\nAttempts: {clip.attempts}"
+            items.append((clip.id, label, tooltip))
+        return items
+
+    @pyqtSlot(str)
+    def _on_retry_requested(self, clip_id: str) -> None:
+        """Re-send a saved recording to the transcription server."""
+        if self.retry_transcriber.is_busy():
+            self.tray_icon.show_notification(
+                "Typr",
+                "A retry is already in progress",
+                self.tray_icon.MessageIcon.Information,
+                self.config.ui.notification_duration,
+            )
+            return
+
+        clip = self.failed_audio.get(clip_id)
+        if clip is None:
+            return
+        try:
+            audio_data = self.failed_audio.load_audio(clip)
+        except OSError as e:
+            logger.error(f"Could not read failed clip {clip_id}: {e}")
+            return
+
+        logger.info(f"Retrying failed recording {clip_id}")
+        self._retrying_clip_id = clip_id
+        self.retry_transcriber.transcribe(audio_data)
+
+    @pyqtSlot(str)
+    def _on_retry_complete(self, text: str) -> None:
+        """A retry succeeded: copy the text, keep it in history, drop the clip."""
+        clip_id, self._retrying_clip_id = self._retrying_clip_id, None
+        if clip_id:
+            self.failed_audio.delete(clip_id)
+
+        if not text or not text.strip():
+            self.tray_icon.show_notification(
+                "Retry Complete",
+                "No speech found in the recording",
+                self.tray_icon.MessageIcon.Information,
+                self.config.ui.notification_duration,
+            )
+            return
+
+        logger.info(f"Retry transcription: {text[:50]}...")
+        self._last_output = text
+        self._record_history(text)
+        self._copy_to_clipboard(text)
+        self.tray_icon.show_notification(
+            "Retry Complete - Copied to Clipboard",
+            text[:100] + ("..." if len(text) > 100 else ""),
+            self.tray_icon.MessageIcon.Information,
+            self.config.ui.notification_duration,
+        )
+
+    @pyqtSlot(str)
+    def _on_retry_error(self, message: str) -> None:
+        """A retry failed: keep the clip and record the new error."""
+        clip_id, self._retrying_clip_id = self._retrying_clip_id, None
+        clip = self.failed_audio.get(clip_id) if clip_id else None
+        if clip is not None:
+            self.failed_audio.mark_failed_again(clip, message)
+        self.tray_icon.show_notification(
+            "Retry Failed",
+            f"{message} (recording kept)",
+            self.tray_icon.MessageIcon.Warning,
+        )
+
+    @pyqtSlot(str)
     def _on_hotkey_error(self, message: str) -> None:
         """Handle hotkey registration errors."""
         logger.error(f"Hotkey error: {message}")
@@ -430,6 +539,13 @@ class TyprApp(QObject):
 
         # Update components with new settings
         self.transcriber.update_settings(
+            api_key=self.config.api_key,
+            api_base_url=self.config.api_base_url,
+            model=self.config.transcription.model,
+            language=self.config.transcription.language,
+            prompt=self.config.transcription.prompt,
+        )
+        self.retry_transcriber.update_settings(
             api_key=self.config.api_key,
             api_base_url=self.config.api_base_url,
             model=self.config.transcription.model,

@@ -37,6 +37,8 @@ class TrayIcon(QSystemTrayIcon):
     toggle_mode = pyqtSignal()
     record_toggled = pyqtSignal(bool)  # True = start, False = stop
     output_selected = pyqtSignal(str)  # Full text of a chosen previous output
+    retry_requested = pyqtSignal(str)  # Id of a failed recording to retry
+    clear_failed_requested = pyqtSignal()
 
     # State colors for icon generation
     STATE_COLORS = {
@@ -62,6 +64,11 @@ class TrayIcon(QSystemTrayIcon):
 
         # Callable returning the recent output texts (newest first).
         self._outputs_provider: Optional[Callable[[], list[str]]] = None
+
+        # Callable returning failed recordings as (id, label, tooltip), newest first.
+        self._failed_provider: Optional[
+            Callable[[], list[tuple[str, str, str]]]
+        ] = None
 
         self._setup_icons()
         self._setup_menu()
@@ -135,6 +142,12 @@ class TrayIcon(QSystemTrayIcon):
         self._outputs_menu.aboutToShow.connect(self._populate_outputs_menu)
         menu.addMenu(self._outputs_menu)
 
+        # Failed recordings - rebuilt each time the menu opens
+        self._failed_menu = QMenu("Retry Failed Recordings", menu)
+        self._failed_menu.setToolTipsVisible(True)
+        self._failed_menu.aboutToShow.connect(self._populate_failed_menu)
+        menu.addMenu(self._failed_menu)
+
         # History
         history_action = QAction("History...", menu)
         history_action.triggered.connect(self.history_requested.emit)
@@ -182,6 +195,38 @@ class TrayIcon(QSystemTrayIcon):
                 lambda _checked=False, t=text: self.output_selected.emit(t)
             )
             menu.addAction(action)
+
+    def set_failed_provider(
+        self, provider: Callable[[], list[tuple[str, str, str]]]
+    ) -> None:
+        """Set the callback used to fetch failed recordings (newest first)."""
+        self._failed_provider = provider
+
+    def _populate_failed_menu(self) -> None:
+        """Rebuild the 'Retry Failed Recordings' submenu."""
+        menu = self._failed_menu
+        menu.clear()
+
+        clips = self._failed_provider() if self._failed_provider else []
+
+        if not clips:
+            empty = QAction("No failed recordings", menu)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+            return
+
+        for clip_id, label, tooltip in clips:
+            action = QAction(label, menu)
+            action.setToolTip(tooltip)
+            action.triggered.connect(
+                lambda _checked=False, c=clip_id: self.retry_requested.emit(c)
+            )
+            menu.addAction(action)
+
+        menu.addSeparator()
+        clear_action = QAction("Discard All", menu)
+        clear_action.triggered.connect(self.clear_failed_requested.emit)
+        menu.addAction(clear_action)
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         """Handle tray icon activation (click)."""
