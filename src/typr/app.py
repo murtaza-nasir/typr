@@ -14,6 +14,7 @@ from typr.core.hotkey_manager import HotkeyManager
 from typr.core.text_injector import TextInjector
 from typr.core.transcriber import WhisperTranscriber
 from typr.ui.tray_icon import TrayIcon, TrayState
+from typr.utils.clipboard import copy_text
 from typr.utils.logger import logger
 
 
@@ -304,9 +305,8 @@ class TyprApp(QObject):
 
     def _copy_to_clipboard(self, text: str) -> None:
         """Copy text to the system clipboard."""
-        clipboard = QApplication.clipboard()
-        if clipboard is not None:
-            clipboard.setText(text)
+        if not copy_text(text):
+            logger.error("Could not copy text to the clipboard")
 
     @pyqtSlot()
     def _on_copy_last(self) -> None:

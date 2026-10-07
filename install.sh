@@ -23,6 +23,7 @@ sudo pacman -S --needed --noconfirm \
     python-pyaudio \
     python-dbus \
     wtype \
+    wl-clipboard \
     portaudio
 
 echo

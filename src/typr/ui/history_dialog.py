@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QGuiApplication, QPalette
+from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from typr.core.history import HistoryEntry, HistoryManager
+from typr.utils.clipboard import copy_text
 
 
 class HistoryRowWidget(QWidget):
@@ -297,13 +298,13 @@ class HistoryDialog(QDialog):
     def _copy_entry_id(self, entry_id: str) -> None:
         entry = self._lookup_entry(entry_id)
         if entry is not None:
-            QGuiApplication.clipboard().setText(entry.text)
+            copy_text(entry.text)
 
     @pyqtSlot()
     def _copy_selected(self) -> None:
         entry = self._current_entry()
         if entry is not None:
-            QGuiApplication.clipboard().setText(entry.text)
+            copy_text(entry.text)
 
     @pyqtSlot(str)
     def _delete_entry_id(self, entry_id: str) -> None:
